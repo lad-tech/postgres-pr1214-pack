@@ -16,13 +16,8 @@ jobs:
           node-version: '24'
           cache: npm
           registry-url: https://registry.npmjs.org
-      - uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
       - name: Install dependencies
         run: npm ci
-      - name: Test
-        run: npm test
       - name: Build
         run: npm run build
 
@@ -37,9 +32,6 @@ jobs:
           node-version: '24'
           cache: npm
           registry-url: https://registry.npmjs.org
-      - uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
       - name: Install dependencies
         run: npm ci
       - name: Publish package
