@@ -15,16 +15,12 @@
 <img height="220" width="458" alt="Good UX with Postgres.js" src="https://raw.githubusercontent.com/porsager/postgres/master/demo.gif">
 <br>
 
-### Installation
-```bash
-$ npm install postgres@npm:@lad-tech/postgres-pr1214-pack@3.4.9-1214.0
-```
 
 ### Usage
 Create your `sql` database instance
 ```js
 // db.js
-import postgres from 'postgres'
+import postgres from 'https://deno.land/x/postgresjs/mod.js'
 
 const sql = postgres({ /* options */ }) // will use psql environment variables
 
