@@ -17,7 +17,7 @@
 
 ### Installation
 ```bash
-$ npm install postgres@npm:@lad-tech/postgres-pr1214-pack@3.4.9-1214.0
+$ npm install postgres@npm:@lad-tech/postgres-pr1214-pack@3.4.9
 ```
 
 ### Usage
