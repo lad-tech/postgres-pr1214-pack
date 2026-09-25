@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.4.10
+- Backport postgres.js PRs #1209, #1215, and #1218 on top of #1214.
+- Clear stale startup query state before retrying a connection after a FATAL response (#1223).
+- Drain transaction writes queued between a TCP error and close to avoid a stuck pool (#1215 discussion).
+- Keep a released handle for a disconnected reserved connection from returning that connection to the pool.
+- Add regressions for startup FATAL and TCP reset, and fix the #1218 test to pass ESLint.
+
 ## v3.4.9
 - Publish the PostgreSQL PR #1214 patch under a stable version so it satisfies stable peer dependency ranges.
 

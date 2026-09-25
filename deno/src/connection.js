@@ -90,6 +90,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     , statementId = Math.random().toString(36).slice(2)
     , statementCount = 1
     , closedTime = 0
+    , closeRunStart = 0
     , remaining = 0
     , hostIndex = 0
     , retries = 0
@@ -173,11 +174,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
         : (query = q, query.active = true)
 
       build(q)
-      return write(toBuffer(q))
+      const written = write(toBuffer(q))
+      // Run the hook whenever the bytes were written, even if the pipeline is
+      // full or socket.write() reported backpressure. sql.begin() relies on it
+      // to reserve the connection, and its falsy return keeps the connection
+      // out of the busy queue until BEGIN completes.
+      return (!q.options.onexecute || q.options.onexecute(connection))
+        && written
         && !q.describeFirst
         && !q.cursorFn
         && sent.length < max_pipeline
-        && (!q.options.onexecute || q.options.onexecute(connection))
     } catch (error) {
       sent.length === 0 && write(Sync)
       errored(error)
@@ -255,6 +261,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   }
 
   function nextWrite(fn) {
+    if (!socket) {
+      // closed() nulls the socket and reconnect() only recreates it on a later
+      // timer. write() is also reached from the 'data' handler, so a throw here
+      // has no query to reject and escapes as an uncaughtException. Settle the
+      // pending queries rather than dropping the write, or the caller hangs.
+      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
+      chunk = nextWriteTimer = null
+      error(Errors.connection('CONNECTION_CLOSED', options, socket))
+      return false
+    }
     const x = socket.write(chunk, fn)
     nextWriteTimer !== null && clearImmediate(nextWriteTimer)
     chunk = nextWriteTimer = null
@@ -441,6 +457,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     remaining = 0
     incomings = null
     clearImmediate(nextWriteTimer)
+    chunk = nextWriteTimer = null
     socket.removeListener('data', data)
     socket.removeListener('connect', connected)
     idleTimer.cancel()
@@ -450,13 +467,33 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     socket.removeAllListeners()
     socket = null
 
-    if (initial)
-      return reconnect()
-
-    !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
     closedTime = performance.now()
-    hadError && options.shared.retries++
+    if (hadError || initial)
+      options.shared.retries++
     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
+
+    if (initial) {
+      closeRunStart || (closeRunStart = closedTime)
+      // Do not schedule a retry beyond the connection's clean-close budget.
+      if (closedTime + delay <= closeRunStart + (options.connect_timeout || 30) * 1000) {
+        // Retain the user's initial query for retry, but discard the state of
+        // the failed startup or fetch_types query before the next connection.
+        query = results = errorResponse = null
+        result = new Result()
+        rows = 0
+        return reconnect()
+      }
+      errored(Errors.connection('CONNECTION_CLOSED', options, socket))
+    }
+
+    closeRunStart = 0
+    // An error event can race with a transaction's rollback before close.
+    // Drain those newly queued writes even when the socket closed with an error.
+    if (query || sent.length)
+      error(Errors.connection('CONNECTION_CLOSED', options, socket))
+    query = results = errorResponse = null
+    result = new Result()
+    rows = 0
     onclose(connection, Errors.connection('CONNECTION_CLOSED', options, socket))
   }
 
@@ -563,12 +600,12 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
       }
 
       if (needsTypes) {
-        initial.reserve && (initial = null)
+        initial.reserve && (options.shared.retries = retries = closeRunStart = 0, initial = null)
         return fetchArrayTypes()
       }
 
       initial && !initial.reserve && execute(initial)
-      options.shared.retries = retries = 0
+      options.shared.retries = retries = closeRunStart = 0
       initial = null
       return
     }
@@ -959,7 +996,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
         return b.i32(0xFFFFFFFF)
 
       type = types[i]
-      parameters[i] = x = type in options.serializers
+      x = type in options.serializers
         ? options.serializers[type](x)
         : '' + x
 

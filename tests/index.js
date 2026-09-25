@@ -303,6 +303,33 @@ t('Many transactions at beginning of connection', async() => {
   return [100, xs.length]
 })
 
+t('Transaction at pipeline boundary is reserved', async() => {
+  const sql = postgres({ ...options, max: 2, max_pipeline: 1, fetch_types: false })
+  await Promise.all([sql`select 1`, sql`select 1`])
+  const inflight = [sql`select pg_sleep(0.1)`.execute(), sql`select pg_sleep(0.1)`.execute()]
+  const x = await sql.begin(sql => sql`select 1 as x`).then(x => x[0].x, x => x.code)
+  await Promise.all(inflight)
+  return [1, x, await sql.end()]
+})
+
+t('Transaction is reserved with pipelining disabled', async() => {
+  const sql = postgres({ ...options, max: 2, max_pipeline: 0, fetch_types: false })
+  const x = await sql.begin(sql => sql`select 1 as x`).then(x => x[0].x, x => x.code)
+  return [1, x, await sql.end()]
+})
+
+t('Query issued while BEGIN is in flight does not join the transaction', async() => {
+  const sql = postgres({ ...options, max: 1, fetch_types: false })
+  await sql`create table test (a int)`
+  const tx = sql.begin(async sql => {
+    await sql`select 1`
+    throw new Error('rollback')
+  }).catch(() => undefined)
+  const insert = sql`insert into test values (1)`
+  await Promise.all([tx, insert])
+  return [1, (await sql`select count(*)::int as n from test`)[0].n, await sql`drop table test`, await sql.end()]
+})
+
 t('Transactions array', async() => {
   await sql`create table test (a int)`
 
@@ -1661,6 +1688,50 @@ t('Clean close deadline resets after a successful query', closeReset)
 t('Clean close deadline resets after reserve with fetch_types', reserveCloseReset)
 t('Clean close deadline resets after a startup error', closeErrorReset)
 
+t('Startup FATAL during fetch_types does not poison the retry', { timeout: 5 }, async() => {
+  const field = (code, value) => Buffer.from(code + value + '\0')
+  const body = Buffer.concat([
+    field('S', 'FATAL'), field('V', 'FATAL'), field('C', '57P01'),
+    field('M', 'terminating connection due to administrator command'), Buffer.from('\0')
+  ])
+  const fatal = Buffer.alloc(5)
+  fatal.write('E')
+  fatal.writeInt32BE(body.length + 4, 1)
+  let killed = false
+  const unhandled = []
+  const onUnhandled = error => unhandled.push(error)
+  const proxy = net.createServer(client => {
+    const upstream = net.connect(5432, '127.0.0.1')
+    client.on('data', chunk => {
+      if (!killed && chunk.includes('typarray')) {
+        killed = true
+        client.end(Buffer.concat([fatal, body]))
+        upstream.destroy()
+      } else {
+        upstream.write(chunk)
+      }
+    })
+    upstream.on('data', chunk => client.writable && client.write(chunk))
+    client.on('error', () => upstream.destroy())
+    upstream.on('error', () => client.destroy())
+    client.on('close', () => upstream.destroy())
+    upstream.on('close', () => client.destroy())
+  })
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve))
+  process.on('unhandledRejection', onUnhandled)
+  const sql = postgres({ ...options, host: '127.0.0.1', port: proxy.address().port })
+
+  try {
+    const [{ ok }] = await sql`select 1 as ok`
+    await new Promise(resolve => setImmediate(resolve))
+    return ['true,1,0', [killed, ok, unhandled.length].join(',')]
+  } finally {
+    await sql.end({ timeout: 0 })
+    process.off('unhandledRejection', onUnhandled)
+    proxy.close()
+  }
+})
+
 t('connect_timeout', { timeout: 20 }, async() => {
   const connect_timeout = 0.2
   const server = net.createServer()
@@ -2512,6 +2583,122 @@ t('Ensure transactions throw if connection is closed dwhile there is no query', 
   return ['CONNECTION_CLOSED', x.code]
 })
 
+t('Disconnect rejects queued transaction queries and allows reconnect', async() => {
+  const sql = postgres({ ...options, max_pipeline: 1, fetch_types: false })
+  let queries
+
+  try {
+    const error = await sql.begin(sql => {
+      queries = [
+        sql`select pg_terminate_backend(pg_backend_pid())`.execute(),
+        sql`select 1`.execute(),
+        sql`select 2`.execute()
+      ]
+      return Promise.allSettled(queries)
+    }).catch(x => x)
+
+    const results = await Promise.allSettled(queries)
+    const [{ x }] = await sql`select 1 as x`
+    return [
+      'CONNECTION_CLOSED,rejected,rejected,rejected,1',
+      [error.code, ...results.map(x => x.status), x].join(',')
+    ]
+  } finally {
+    await sql.end({ timeout: 0 })
+  }
+})
+
+t('Reset inside a transaction does not strand the next query', { timeout: 8 }, async() => {
+  if (!net.Socket.prototype.resetAndDestroy)
+    return [true, true] // TCP RST is unavailable on older supported Node versions.
+
+  const sockets = new Set()
+  const proxy = net.createServer(client => {
+    const upstream = net.connect(5432, '127.0.0.1')
+    client.pipe(upstream).pipe(client)
+    client.on('error', () => undefined)
+    upstream.on('error', () => undefined)
+    sockets.add([client, upstream])
+  })
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve))
+  const sql = postgres({ ...options, host: '127.0.0.1', port: proxy.address().port, max: 1, fetch_types: false })
+
+  try {
+    const error = await sql.begin(async tx => {
+      setTimeout(() => {
+        for (const [client, upstream] of sockets) {
+          upstream.destroy()
+          client.resetAndDestroy()
+        }
+      }, 100)
+      await tx`select pg_sleep(1)`
+    }).catch(error => error)
+    const first = await sql`select 'first' as x`
+    const second = await Promise.race([
+      sql`select 'second' as x`.then(rows => rows[0].x),
+      delay(1500).then(() => 'PENDING')
+    ])
+    return ['CONNECTION_CLOSED,first,second', [error.code, first[0].x, second].join(',')]
+  } finally {
+    await sql.end({ timeout: 0 })
+    for (const [client, upstream] of sockets) {
+      client.destroy()
+      upstream.destroy()
+    }
+    proxy.close()
+  }
+})
+
+t('Disconnected transaction cannot query a reused connection', async() =>
+  withDisconnectedTransaction(({ sql, disconnected }) => sql.begin(async sql => {
+    await sql`select set_config('postgres_js.test', 'replacement', true)`
+    const result = await disconnected`select current_setting('postgres_js.test') as x`.catch(x => x)
+    return ['CONNECTION_CLOSED', result.code]
+  }))
+)
+
+t('Disconnected transaction cannot commit a reused connection', async() =>
+  finishDisconnectedTransaction()
+)
+
+t('Disconnected transaction cannot roll back a reused connection', async() =>
+  finishDisconnectedTransaction(new Error('original callback failed'))
+)
+
+function finishDisconnectedTransaction(error) {
+  return withDisconnectedTransaction(({ sql, finish }) => sql.begin(async sql => {
+    const [{ x: before }] = await sql`select txid_current()::text as x`
+    finish(error)
+    await new Promise(resolve => setImmediate(resolve))
+    const [{ x: after }] = await sql`select txid_current()::text as x`
+    return [before, after]
+  }))
+}
+
+async function withDisconnectedTransaction(fn) {
+  const pool = postgres({ ...options, fetch_types: false })
+  let finish
+    , ready
+  const gate = new Promise((resolve, reject) => finish = error => error ? reject(error) : resolve())
+  const connected = new Promise(resolve => ready = resolve)
+  const failed = pool.begin(async sql => {
+    const [{ pid }] = await sql`select pg_backend_pid() as pid`
+    ready({ disconnected: sql, pid })
+    await gate
+  }).catch(x => x)
+
+  try {
+    const { disconnected, pid } = await Promise.race([connected, failed.then(error => { throw error })])
+    await sql`select pg_terminate_backend(${ pid }::int)`
+    await failed
+    return await fn({ sql: pool, disconnected, finish })
+  } finally {
+    finish()
+    await new Promise(resolve => setImmediate(resolve))
+    await pool.end({ timeout: 0 })
+  }
+}
+
 t('Custom socket', {}, async() => {
   let result
   const sql = postgres({
@@ -2716,6 +2903,44 @@ t('Ensure reserve on query throws proper error', async() => {
   return [
     'wat', x, reserved.release()
   ]
+})
+
+t('Writing to a closed reserved connection rejects instead of crashing', async() => {
+  let downstream
+  const proxy = net.createServer(x => {
+    downstream = x
+    const upstream = net.connect(5432, '127.0.0.1')
+    x.pipe(upstream).pipe(x)
+    x.on('error', () => upstream.destroy())
+    upstream.on('error', () => x.destroy())
+  })
+
+  await new Promise(r => proxy.listen(0, r))
+
+  const sql = postgres({ ...options, host: '127.0.0.1', port: proxy.address().port, max: 1 })
+      , reserved = await sql.reserve()
+
+  await reserved`select 1`
+  downstream.end()
+  await delay(50)
+
+  const code = await reserved`select 1`.catch(e => e.code)
+  const replacement = await sql.reserve()
+  reserved.release()
+  let outsideSettled = false
+  const outside = sql`select 3 as y`.then(rows => {
+    outsideSettled = true
+    return rows[0].y
+  })
+  await delay(30)
+  const [{ x }] = await replacement`select 2 as x`
+  const wasQueued = !outsideSettled
+  replacement.release()
+  const y = await outside
+  await sql.end({ timeout: 0 })
+  proxy.close()
+
+  return ['CONNECTION_CLOSED,2,true,3', [code, x, wasQueued, y].join(',')]
 })
 
 t('query during copy error', async() => {

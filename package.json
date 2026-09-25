@@ -1,6 +1,6 @@
 {
   "name": "@lad-tech/postgres-pr1214-pack",
-  "version": "3.4.9",
+  "version": "3.4.10",
   "description": "Fastest full featured PostgreSQL client for Node.js",
   "type": "module",
   "module": "src/index.js",

@@ -16,6 +16,14 @@
 <br>
 
 
+This fork is based on postgres.js 3.4.9. Version 3.4.10 includes the fixes from
+[#1214](https://github.com/porsager/postgres/pull/1214),
+[#1209](https://github.com/porsager/postgres/pull/1209),
+[#1215](https://github.com/porsager/postgres/pull/1215), and
+[#1218](https://github.com/porsager/postgres/pull/1218), plus close-state
+regressions for startup FATAL responses and TCP resets described in
+[#1223](https://github.com/porsager/postgres/issues/1223) and the discussion on #1215.
+
 ### Usage
 Create your `sql` database instance
 ```js

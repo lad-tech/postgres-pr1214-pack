@@ -171,11 +171,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
         : (query = q, query.active = true)
 
       build(q)
-      return write(toBuffer(q))
+      const written = write(toBuffer(q))
+      // Run the hook whenever the bytes were written, even if the pipeline is
+      // full or socket.write() reported backpressure. sql.begin() relies on it
+      // to reserve the connection, and its falsy return keeps the connection
+      // out of the busy queue until BEGIN completes.
+      return (!q.options.onexecute || q.options.onexecute(connection))
+        && written
         && !q.describeFirst
         && !q.cursorFn
         && sent.length < max_pipeline
-        && (!q.options.onexecute || q.options.onexecute(connection))
     } catch (error) {
       sent.length === 0 && write(Sync)
       errored(error)
@@ -253,6 +258,16 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
   }
 
   function nextWrite(fn) {
+    if (!socket) {
+      // closed() nulls the socket and reconnect() only recreates it on a later
+      // timer. write() is also reached from the 'data' handler, so a throw here
+      // has no query to reject and escapes as an uncaughtException. Settle the
+      // pending queries rather than dropping the write, or the caller hangs.
+      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
+      chunk = nextWriteTimer = null
+      error(Errors.connection('CONNECTION_CLOSED', options, socket))
+      return false
+    }
     const x = socket.write(chunk, fn)
     nextWriteTimer !== null && clearImmediate(nextWriteTimer)
     chunk = nextWriteTimer = null
@@ -439,6 +454,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     remaining = 0
     incomings = null
     clearImmediate(nextWriteTimer)
+    chunk = nextWriteTimer = null
     socket.removeListener('data', data)
     socket.removeListener('connect', connected)
     idleTimer.cancel()
@@ -456,13 +472,25 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
     if (initial) {
       closeRunStart || (closeRunStart = closedTime)
       // Do not schedule a retry beyond the connection's clean-close budget.
-      if (closedTime + delay <= closeRunStart + (options.connect_timeout || 30) * 1000)
+      if (closedTime + delay <= closeRunStart + (options.connect_timeout || 30) * 1000) {
+        // Retain the user's initial query for retry, but discard the state of
+        // the failed startup or fetch_types query before the next connection.
+        query = results = errorResponse = null
+        result = new Result()
+        rows = 0
         return reconnect()
+      }
       errored(Errors.connection('CONNECTION_CLOSED', options, socket))
     }
 
     closeRunStart = 0
-    !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
+    // An error event can race with a transaction's rollback before close.
+    // Drain those newly queued writes even when the socket closed with an error.
+    if (query || sent.length)
+      error(Errors.connection('CONNECTION_CLOSED', options, socket))
+    query = results = errorResponse = null
+    result = new Result()
+    rows = 0
     onclose(connection, Errors.connection('CONNECTION_CLOSED', options, socket))
   }
 

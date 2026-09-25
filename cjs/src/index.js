@@ -211,13 +211,18 @@ function Postgres(a, b) {
       })
 
     move(c, reserved)
-    c.reserved = () => queue.length
+    const reservation = () => queue.length
       ? c.execute(queue.shift())
       : move(c, reserved)
+    c.reserved = reservation
     c.reserved.release = true
 
     const sql = Sql(handler)
     sql.release = () => {
+      // onclose() clears the reservation. A stale handle must not release a
+      // disconnected connection or a newer reservation on the same slot.
+      if (c.reserved !== reservation)
+        return
       c.reserved = null
       onopen(c)
     }
@@ -236,13 +241,19 @@ function Postgres(a, b) {
     const queries = Queue()
     let savepoints = 0
       , connection
+      , closedError
       , prepare = null
 
     try {
       await sql.unsafe('begin ' + options.replace(/[^a-z ]/ig, ''), [], { onexecute }).execute()
       return await Promise.race([
         scope(connection, fn),
-        new Promise((_, reject) => connection.onclose = reject)
+        new Promise((_, reject) => connection.onclose = error => {
+          closedError = error
+          while (queries.length)
+            queries.shift().reject(error)
+          reject(error)
+        })
       ])
     } catch (error) {
       throw error
@@ -290,6 +301,8 @@ function Postgres(a, b) {
 
       function handler(q) {
         q.catch(e => uncaughtError || (uncaughtError = e))
+        if (closedError)
+          return q.reject(closedError)
         c.queue === full
           ? queries.push(q)
           : c.execute(q) || move(c, full)
